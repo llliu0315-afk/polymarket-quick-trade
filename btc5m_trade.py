@@ -2,24 +2,23 @@
 """
 btc5m_trade.py — Polymarket BTC 5 分钟 Up/Down 专用快捷交易面板
 
-启动:  python btc5m_trade.py
-打开:  http://127.0.0.1:8890  (启动时终端会打印带 token 的完整链接)
+启动:  python btc5m_trade.py      (推荐: python run_btc5m.py 同时启动链上研究榜)
+打开:  启动时终端会打印带 token 的完整链接
 
 快捷键:
   ↑ = 买 UP        ↓ = 买 DOWN
   Q = 卖出全部 UP   W = 卖出全部 DOWN
   1-5 = 选金额      Esc = 撤销全部挂单      K = 锁盘/解锁
 
-相对原版 quick_trade.py 的改动:
-  * 只保留 btc-updown-5m 单市场, 删除多市场切换/1h slug 等逻辑
-  * 盘口改为 CLOB WebSocket 推送 (REST 轮询仅作断线兜底)
-  * 回合结束前 15 秒预拉下一轮 token_id, 换轮零等待
-  * 下单前沿盘口逐档模拟成交, 按回合阶段限制最大滑点
-  * 卖出全部默认 FAK (可部分成交), 买入 FOK
-  * 热键冷却 / 单笔上限 / 单边敞口上限 / 一键锁盘
-  * 页面通过 SSE 推送状态, 所有写接口需 token + Origin 校验
-  * 不再关闭 TLS 校验; builder code 从 .env 读取 (可留空)
-  * 交易记录追加写入 trades.jsonl
+要点:
+  * 仅 btc-updown-5m; 盘口走 CLOB WebSocket, 断线 3s 后 REST 兜底
+  * 回合结束前 15 秒预拉下一轮 token; 回合边界 / 下单后由事件立即唤醒后台线程
+  * 启动时用 CLOB /time 校准本地时钟偏移 (>1.5s 才生效)
+  * 下单前沿盘口逐档模拟成交, 估算 taker 费 (rate × 股数 × p × (1-p)),
+    显示含费均价与盈亏平衡胜率; 按回合阶段限制最大滑点
+  * 买入 FOK, 卖出全部默认 FAK; 下单成功后先乐观更新持仓, 再由余额查询确认
+  * 热键冷却 / 单笔上限 / 单边敞口上限 / 最后 N 秒禁买 / 一键锁盘
+  * SSE 推送状态; 写接口需 token + Origin 校验; TLS 校验保持开启
 """
 
 import asyncio
@@ -57,19 +56,43 @@ HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8890"))
 BUILDER_CODE = os.getenv("BUILDER_CODE", "").strip()   # 留空则不附带
 
+# taker 费: fee = rate × 股数 × p × (1-p); 设为 0 关闭估算
+TAKER_FEE_RATE = max(0.0, float(os.getenv("TAKER_FEE_RATE", "0.07")))
+
 # ── 风控参数 (.env 可覆盖) ─────────────────────────────────────────────────────
 MAX_ORDER_USD = float(os.getenv("MAX_ORDER_USD", "200"))
 MAX_SIDE_EXPOSURE_USD = float(os.getenv("MAX_SIDE_EXPOSURE_USD", "500"))
 HOTKEY_COOLDOWN_MS = int(os.getenv("HOTKEY_COOLDOWN_MS", "400"))
-# 按剩余秒数分档的最大允许滑点 (相对最优价, 单位: 美元/股)
-SLIPPAGE_TIERS = [
-    (240, float(os.getenv("SLIP_EARLY", "0.03"))),   # 剩余 > 240s
-    (60,  float(os.getenv("SLIP_MID", "0.05"))),     # 60 ~ 240s
-    (0,   float(os.getenv("SLIP_LATE", "0.08"))),    # < 60s
+SLIPPAGE_TIERS = [                 # (剩余秒数阈值, 相对最优价的最大滑点)
+    (240, float(os.getenv("SLIP_EARLY", "0.03"))),
+    (60,  float(os.getenv("SLIP_MID", "0.05"))),
+    (0,   float(os.getenv("SLIP_LATE", "0.08"))),
 ]
-BLOCK_MARKET_LAST_SECONDS = int(os.getenv("BLOCK_LAST_SECS", "5"))   # 最后 N 秒禁止市价买入
+BLOCK_MARKET_LAST_SECONDS = int(os.getenv("BLOCK_LAST_SECS", "5"))
+OPTIMISTIC_HOLD_SECONDS = 8        # 乐观持仓等待链上余额确认的最长时间
 
 AMOUNT_PRESETS = [5, 10, 20, 50, 100]
+
+# ── 时钟 ──────────────────────────────────────────────────────────────────────
+CLOCK_OFFSET = 0.0
+
+def now() -> float:
+    """经服务器校准后的当前时间 (秒)."""
+    return time.time() + CLOCK_OFFSET
+
+def sync_clock():
+    """用 CLOB /time 估算本地时钟偏移; 服务器只返回整秒, 故 <1.5s 视为噪声."""
+    global CLOCK_OFFSET
+    try:
+        t0 = time.time()
+        r = requests.get(f"{CLOB_HTTP}/time", timeout=5)
+        t1 = time.time()
+        server = float(str(r.json()).strip('"'))
+        off = server - (t0 + t1) / 2
+        CLOCK_OFFSET = off if abs(off) > 1.5 else 0.0
+        print(f"⏱  时钟偏移 {off:+.2f}s → 采用 {CLOCK_OFFSET:+.2f}s")
+    except Exception as e:
+        print(f"[clock] 校准失败, 使用本地时间: {e}")
 
 # ── 账号 ──────────────────────────────────────────────────────────────────────
 def _load_accounts():
@@ -101,22 +124,25 @@ def _current_account():
 state_lock = threading.Lock()
 state = {
     "round_ts": 0, "round_end": 0,
-    "token_ids": {},            # {"up": id, "down": id}
+    "token_ids": {},
     "next_token_ids": {}, "next_round_ts": 0,
     "strike": 0.0, "strike_confirmed": False,
     "btc": 0.0,
     "up_bid": 0.0, "up_ask": 0.0, "down_bid": 0.0, "down_ask": 0.0,
     "up_book": {"bids": [], "asks": []}, "down_book": {"bids": [], "asks": []},
     "up_position": 0.0, "down_position": 0.0,
+    "up_pending": False, "down_pending": False,
     "usdc_balance": 0.0,
     "locked": False,
     "conn": {"rtds": False, "clob_ws": False},
     "last_book_ts": 0.0,
 }
-_rtds_prices = {"btc/usd": 0.0}      # 兼容 onchain_leaderboard 嵌入写入
+_rtds_prices = {"btc/usd": 0.0}
 _embedded = False
 trade_log = deque(maxlen=60)
-_refresh_event = threading.Event()   # 交易后立即刷新余额/持仓
+_refresh_event = threading.Event()   # 需要刷新余额/持仓
+_wake = threading.Event()            # 唤醒 round_worker
+_pending_pos = {}                    # side -> (下单前持仓, 过期时间)
 _last_trade_ts = 0.0
 _trade_gate = threading.Lock()
 API_TOKEN = secrets.token_urlsafe(24)
@@ -192,7 +218,6 @@ def get_clob_client():
         from py_clob_client_v2.clob_types import ApiCreds
         c = ClobClient(host=CLOB_HTTP, key=acct["private_key"], chain_id=CHAIN_ID,
                        signature_type=SIGNATURE_TYPE, funder=acct["funder"])
-        # 优先使用 .env 中显式提供的凭证 (deposit wallet 推荐)
         ek, es, ep = os.getenv("CLOB_API_KEY", ""), os.getenv("CLOB_API_SECRET", ""), os.getenv("CLOB_API_PASSPHRASE", "")
         if idx == 0 and ek and es and ep:
             c.set_api_creds(ApiCreds(api_key=ek, api_secret=es, api_passphrase=ep))
@@ -211,8 +236,8 @@ def get_clob_client():
 
 # ── 回合 / 锚定价 ─────────────────────────────────────────────────────────────
 def round_ts_now():
-    now = int(time.time())
-    return now - now % ROUND_SECONDS
+    t = int(now())
+    return t - t % ROUND_SECONDS
 
 def fetch_token_ids(rts: int) -> dict:
     data = _get_json(GAMMA_EVENTS, params={"slug": f"{SLUG_PREFIX}-{rts}"}, timeout=8)
@@ -240,60 +265,91 @@ def fetch_strike(rts: int):
     return 0.0, False
 
 
-# ── 盘口模拟 / 风控 ───────────────────────────────────────────────────────────
+# ── 费用 / 盘口模拟 / 风控 ────────────────────────────────────────────────────
+def taker_fee(shares: float, price: float) -> float:
+    return TAKER_FEE_RATE * shares * price * (1 - price)
+
 def max_slippage_now() -> float:
     with state_lock:
-        remain = state["round_end"] - time.time()
+        remain = state["round_end"] - now()
     for threshold, slip in SLIPPAGE_TIERS:
         if remain > threshold:
             return slip
     return SLIPPAGE_TIERS[-1][1]
 
 def simulate_buy(asks, amount_usd):
-    """沿 asks 逐档吃单, 返回 (shares, avg_price, worst_price, filled_usd)."""
-    left, shares, worst = amount_usd, 0.0, 0.0
+    """沿 asks 逐档吃单.
+    返回 dict: shares, avg (不含费), eff (含费均价 = 盈亏平衡胜率), fee, worst, filled."""
+    left, shares, worst, fee = amount_usd, 0.0, 0.0, 0.0
     for lvl in sorted(asks, key=lambda x: x["p"]):
         if left <= 1e-9:
             break
         take_usd = min(left, lvl["p"] * lvl["s"])
-        shares += take_usd / lvl["p"]
+        sh = take_usd / lvl["p"]
+        shares += sh
+        fee += taker_fee(sh, lvl["p"])
         left -= take_usd
         worst = lvl["p"]
     filled = amount_usd - left
     avg = filled / shares if shares else 0.0
-    return shares, avg, worst, filled
+    eff = (filled + fee) / shares if shares else 0.0
+    return {"shares": shares, "avg": avg, "eff": eff, "fee": fee, "worst": worst, "filled": filled}
 
 def simulate_sell(bids, qty):
-    left, usd, worst = qty, 0.0, 0.0
+    """沿 bids 逐档卖出. 返回 dict: filled, avg, net_avg (扣费), fee, worst, usd, net_usd."""
+    left, usd, worst, fee = qty, 0.0, 0.0, 0.0
     for lvl in sorted(bids, key=lambda x: -x["p"]):
         if left <= 1e-9:
             break
         take = min(left, lvl["s"])
         usd += take * lvl["p"]
+        fee += taker_fee(take, lvl["p"])
         left -= take
         worst = lvl["p"]
     filled = qty - left
     avg = usd / filled if filled else 0.0
-    return filled, avg, worst, usd
+    net = usd - fee
+    return {"filled": filled, "avg": avg, "net_avg": net / filled if filled else 0.0,
+            "fee": fee, "worst": worst, "usd": usd, "net_usd": net}
 
 def _risk_check(side, amount_usd):
-    global _last_trade_ts
     with state_lock:
         if state["locked"]:
             return "已锁盘 (按 K 解锁)"
         pos = state[f"{side}_position"]
         px = state[f"{side}_ask"] or state[f"{side}_bid"]
-        remain = state["round_end"] - time.time()
+        remain = state["round_end"] - now()
     if amount_usd > MAX_ORDER_USD:
         return f"单笔超限 ${amount_usd:.0f} > ${MAX_ORDER_USD:.0f}"
     if pos * px + amount_usd > MAX_SIDE_EXPOSURE_USD:
         return f"{side.upper()} 敞口将超 ${MAX_SIDE_EXPOSURE_USD:.0f}"
     if remain < BLOCK_MARKET_LAST_SECONDS:
         return f"回合最后 {BLOCK_MARKET_LAST_SECONDS}s 禁止市价买入"
-    now = time.time()
-    if (now - _last_trade_ts) * 1000 < HOTKEY_COOLDOWN_MS:
+    if (time.time() - _last_trade_ts) * 1000 < HOTKEY_COOLDOWN_MS:
         return "操作过快 (冷却中)"
     return None
+
+
+# ── 持仓乐观更新 ──────────────────────────────────────────────────────────────
+def _optimistic(side, delta):
+    """下单成功后立即调整面板持仓; 余额查询返回与下单前相同的值时, 在保持期内忽略."""
+    with state_lock:
+        old = state[f"{side}_position"]
+        if side not in _pending_pos:
+            _pending_pos[side] = (old, time.time() + OPTIMISTIC_HOLD_SECONDS)
+        else:
+            _pending_pos[side] = (_pending_pos[side][0], time.time() + OPTIMISTIC_HOLD_SECONDS)
+        state[f"{side}_position"] = max(0.0, old + delta)
+        state[f"{side}_pending"] = True
+
+def _apply_position(side, value):
+    with state_lock:
+        p = _pending_pos.get(side)
+        if p and time.time() < p[1] and abs(value - p[0]) < 0.01:
+            return                                  # 链上尚未结算, 保留乐观值
+        _pending_pos.pop(side, None)
+        state[f"{side}_position"] = value
+        state[f"{side}_pending"] = False
 
 
 # ── 交易执行 ──────────────────────────────────────────────────────────────────
@@ -309,6 +365,7 @@ def _log(success, msg, ms, extra=None):
     except Exception:
         pass
     _refresh_event.set()
+    _wake.set()
 
 def _market_args(token_id, amount, price, side_const, otype):
     from py_clob_client_v2.clob_types import MarketOrderArgs
@@ -331,13 +388,13 @@ def execute_buy(side, amount_usd):
         return {"success": False, "message": "回合未就绪"}
     if not asks or best_ask <= 0:
         return {"success": False, "message": "无卖盘"}
-    shares, avg, worst, filled = simulate_buy(asks, amount_usd)
+    sim = simulate_buy(asks, amount_usd)
     slip = max_slippage_now()
-    if filled + 0.01 < amount_usd:
-        return {"success": False, "message": f"深度不足: 仅可成交 ${filled:.2f}"}
-    if avg - best_ask > slip:
-        return {"success": False, "message": f"预计滑点 {avg-best_ask:.3f} > 上限 {slip:.2f}, 拒绝"}
-    limit_px = round(min(worst + 0.01, 0.99), 2)
+    if sim["filled"] + 0.01 < amount_usd:
+        return {"success": False, "message": f"深度不足: 仅可成交 ${sim['filled']:.2f}"}
+    if sim["avg"] - best_ask > slip:
+        return {"success": False, "message": f"预计滑点 {sim['avg']-best_ask:.3f} > 上限 {slip:.2f}, 拒绝"}
+    limit_px = round(min(sim["worst"] + 0.01, 0.99), 2)
     try:
         from py_clob_client_v2.clob_types import OrderType
         from py_clob_client_v2.order_builder.constants import BUY
@@ -348,9 +405,13 @@ def execute_buy(side, amount_usd):
         ms = int((time.time() - t0) * 1000)
         status = (resp or {}).get("status", "")
         oid = (resp or {}).get("orderID", (resp or {}).get("id", ""))
-        ok = status not in ("", "unmatched", "failed") if status else True
-        msg = f"BUY {side.upper()} ~{shares:.1f}sh @≈{avg:.3f} (${amount_usd:.0f}) [{status or 'sent'}]"
-        _log(ok, msg, ms, {"side": side, "action": "buy", "usd": amount_usd, "est_avg": avg, "order_id": oid})
+        ok = status not in ("unmatched", "failed")
+        if ok:
+            _optimistic(side, sim["shares"])
+        msg = (f"BUY {side.upper()} ~{sim['shares']:.1f}sh @≈{sim['avg']:.3f} "
+               f"含费{sim['eff']:.3f} 盈亏平衡{sim['eff']*100:.1f}% [{status or 'sent'}]")
+        _log(ok, msg, ms, {"side": side, "action": "buy", "usd": amount_usd, "est_avg": sim["avg"],
+                           "est_fee": sim["fee"], "breakeven": sim["eff"], "order_id": oid})
         return {"success": ok, "message": msg, "elapsed_ms": ms}
     except Exception as e:
         ms = int((time.time() - t0) * 1000)
@@ -381,8 +442,8 @@ def execute_sell(side, amount, mode="fak"):
     qty = math.floor(qty * 100) / 100
     if qty <= 0:
         return {"success": False, "message": "可卖份额为 0"}
-    filled, avg, worst, usd = simulate_sell(bids, qty)
-    limit_px = round(max(worst - 0.01, 0.01), 2) if filled > 0 else round(max(best_bid - 0.05, 0.01), 2)
+    sim = simulate_sell(bids, qty)
+    limit_px = round(max(sim["worst"] - 0.01, 0.01), 2) if sim["filled"] > 0 else round(max(best_bid - 0.05, 0.01), 2)
     try:
         from py_clob_client_v2.clob_types import OrderType
         from py_clob_client_v2.order_builder.constants import SELL
@@ -395,9 +456,13 @@ def execute_sell(side, amount, mode="fak"):
         status = (resp or {}).get("status", "")
         oid = (resp or {}).get("orderID", (resp or {}).get("id", ""))
         ok = status not in ("unmatched", "failed")
+        if ok:
+            _optimistic(side, -sim["filled"])
         tag = "ALL " if amount == "all" else ""
-        msg = f"SELL {tag}{side.upper()} {qty:.1f}sh @≈{avg:.3f} (${usd:.1f}) [{status or 'sent'}]"
-        _log(ok, msg, ms, {"side": side, "action": "sell", "shares": qty, "est_avg": avg, "order_id": oid})
+        msg = (f"SELL {tag}{side.upper()} {qty:.1f}sh @≈{sim['avg']:.3f} "
+               f"扣费净得${sim['net_usd']:.2f} [{status or 'sent'}]")
+        _log(ok, msg, ms, {"side": side, "action": "sell", "shares": qty, "est_avg": sim["avg"],
+                           "est_fee": sim["fee"], "order_id": oid})
         return {"success": ok, "message": msg, "elapsed_ms": ms}
     except Exception as e:
         ms = int((time.time() - t0) * 1000)
@@ -430,7 +495,7 @@ def execute_limit(side, buy_or_sell, price, amount_usd):
         resp = client.post_order(signed, OrderType.GTC)
         ms = int((time.time() - t0) * 1000)
         oid = (resp or {}).get("orderID", (resp or {}).get("id", ""))
-        msg = f"LIMIT {buy_or_sell.upper()} {side.upper()} {shares:.1f}sh @ {price:.2f}"
+        msg = f"LIMIT {buy_or_sell.upper()} {side.upper()} {shares:.1f}sh @ {price:.2f} (挂单成交为 maker, 无 taker 费)"
         _log(True, msg, ms, {"side": side, "action": f"limit_{buy_or_sell}", "price": price, "order_id": oid})
         return {"success": True, "message": msg, "elapsed_ms": ms}
     except Exception as e:
@@ -475,15 +540,37 @@ def handle_trade(d: dict) -> dict:
         return {"success": False, "message": f"未知操作 {action}"}
 
 
-# ── 后台: 回合 / 锚定价 / 余额 ────────────────────────────────────────────────
+# ── 后台: 回合 / 锚定价 / 余额 (事件驱动) ─────────────────────────────────────
+def _next_wake_in(round_ready: bool, strike_pending: bool) -> float:
+    """距下一次需要动作的秒数: 回合边界、预拉时刻、余额轮询、待确认持仓."""
+    t = now()
+    with state_lock:
+        end = state["round_end"]
+        nxt = state["next_round_ts"]
+    cands = [5.0, (ROUND_SECONDS - t % ROUND_SECONDS) + 0.05]
+    if not round_ready:
+        cands.append(0.5)
+    if strike_pending:
+        cands.append(1.0)
+    if end and nxt != end:
+        pre = end - PREFETCH_BEFORE_END - t
+        cands.append(pre + 0.05 if pre > 0 else 1.0)
+    if _pending_pos:
+        cands.append(1.0)
+    return max(0.05, min(cands))
+
 def round_worker():
     last_round, strike_done = 0, 0
     last_bal, last_bal_idx = 0.0, -1
+    last_clock = time.time()
     while True:
         strike_pending = False
+        round_ready = True
         try:
+            if time.time() - last_clock > 1800:
+                sync_clock()
+                last_clock = time.time()
             rts = round_ts_now()
-            # 新回合: 优先使用预拉的 token
             if rts != last_round:
                 with state_lock:
                     pre = state["next_token_ids"] if state["next_round_ts"] == rts else {}
@@ -492,22 +579,24 @@ def round_worker():
                     with state_lock:
                         state.update(round_ts=rts, round_end=rts + ROUND_SECONDS, token_ids=toks,
                                      strike=0.0, strike_confirmed=False, up_position=0.0, down_position=0.0,
+                                     up_pending=False, down_pending=False,
                                      next_token_ids={}, next_round_ts=0,
                                      up_book={"bids": [], "asks": []}, down_book={"bids": [], "asks": []},
                                      up_bid=0.0, up_ask=0.0, down_bid=0.0, down_ask=0.0)
+                        _pending_pos.clear()
                     last_round = rts
                     _refresh_event.set()
                     print(f"🔄 新回合 {datetime.fromtimestamp(rts).strftime('%H:%M:%S')} {'(预拉)' if pre else ''}")
-            # 预拉下一轮
+                else:
+                    round_ready = False
             with state_lock:
-                need_pre = (state["round_end"] - time.time() <= PREFETCH_BEFORE_END
+                need_pre = (state["round_end"] and state["round_end"] - now() <= PREFETCH_BEFORE_END
                             and state["next_round_ts"] != rts + ROUND_SECONDS)
             if need_pre:
                 nxt = fetch_token_ids(rts + ROUND_SECONDS)
                 if nxt:
                     with state_lock:
                         state["next_token_ids"], state["next_round_ts"] = nxt, rts + ROUND_SECONDS
-            # 锚定价
             if last_round and strike_done != last_round:
                 strike_pending = True
                 px, ok = fetch_strike(last_round)
@@ -518,18 +607,19 @@ def round_worker():
                         strike_done = last_round
                         strike_pending = False
                         print(f"📌 锚定价 ${px:,.2f}")
-            # 余额 / 持仓 (5s 或交易后立即)
             acct = _current_account()
             with _account_lock:
                 idx = _account_idx
-            if acct["private_key"] and (idx != last_bal_idx or time.time() - last_bal >= 5 or _refresh_event.is_set()):
+            due = (idx != last_bal_idx or time.time() - last_bal >= 5 or _refresh_event.is_set()
+                   or (_pending_pos and time.time() - last_bal >= 1))
+            if acct["private_key"] and due:
                 _refresh_event.clear()
                 last_bal, last_bal_idx = time.time(), idx
                 try:
                     from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
                     c = get_clob_client()
                     d = c.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-                    b = d.get("balance") or d.get("collateral", {}).get("balance", 0) if isinstance(d, dict) else 0
+                    b = (d.get("balance") or d.get("collateral", {}).get("balance", 0)) if isinstance(d, dict) else 0
                     with state_lock:
                         state["usdc_balance"] = float(b) / 1e6 if b else 0.0
                         toks = dict(state["token_ids"])
@@ -537,13 +627,14 @@ def round_worker():
                         if toks.get(sd):
                             cd = c.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=str(toks[sd])))
                             cb = cd.get("balance", 0) if isinstance(cd, dict) else 0
-                            with state_lock:
-                                state[f"{sd}_position"] = float(cb) / 1e6 if cb else 0.0
+                            _apply_position(sd, float(cb) / 1e6 if cb else 0.0)
                 except Exception as e:
                     print(f"[balance] {e}")
         except Exception as e:
             print(f"[round_worker] {e}")
-        time.sleep(1 if strike_pending else 2)
+            round_ready = False
+        _wake.wait(_next_wake_in(round_ready, strike_pending))
+        _wake.clear()
 
 
 # ── 后台: WebSocket (CLOB 盘口 + RTDS 现价) ───────────────────────────────────
@@ -557,7 +648,6 @@ def _apply_book(side, bids, asks):
         state["last_book_ts"] = time.time()
 
 def _apply_price_change(side, changes):
-    """price_change 事件: 增量更新对应档位."""
     with state_lock:
         book = {"bids": list(state[f"{side}_book"]["bids"]), "asks": list(state[f"{side}_book"]["asks"])}
     for ch in changes:
@@ -574,6 +664,7 @@ def ws_worker():
     import websockets
 
     async def clob_loop():
+        logged = 0
         while True:
             with state_lock:
                 toks = dict(state["token_ids"])
@@ -590,9 +681,12 @@ def ws_worker():
                     async for raw in ws:
                         with state_lock:
                             if dict(state["token_ids"]) != toks:
-                                break          # 换轮 → 重新订阅
+                                break
                         if not raw or not raw.strip():
                             continue
+                        if logged < 5 and os.getenv("WS_DEBUG", "1") == "1":
+                            logged += 1
+                            print(f"[clob_ws raw {logged}/5] {str(raw)[:300]}")
                         try:
                             data = json.loads(raw)
                         except ValueError:
@@ -647,7 +741,6 @@ def ws_worker():
             await asyncio.sleep(2)
 
     async def rest_fallback():
-        """WS 断开或 3s 无盘口更新时, 以 1s REST 兜底."""
         s = requests.Session()
         while True:
             await asyncio.sleep(1)
@@ -676,13 +769,14 @@ def _snapshot():
     with state_lock:
         s = json.loads(json.dumps(state))
     s["btc"] = s["btc"] or _rtds_prices.get("btc/usd", 0.0)
-    s["now"] = time.time()
+    s["now"] = now()
     s["account"] = _current_account()["label"]
     s["accounts"] = [a["label"] for a in ACCOUNTS]
     s["account_idx"] = _account_idx
     s["log"] = list(trade_log)
     s["max_slip"] = max_slippage_now()
     s["limits"] = {"order": MAX_ORDER_USD, "exposure": MAX_SIDE_EXPOSURE_USD}
+    s["fee_rate"] = TAKER_FEE_RATE
     s.pop("next_token_ids", None)
     return s
 
@@ -714,7 +808,10 @@ async def account_api(req):
     if 0 <= i < len(ACCOUNTS):
         with _account_lock:
             _account_idx = i
+        with state_lock:
+            _pending_pos.clear()
         _refresh_event.set()
+        _wake.set()
         return web.json_response({"success": True})
     return web.json_response({"success": False, "message": "无效账号"})
 
@@ -745,19 +842,22 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px}
 .hero{grid-column:1/3;display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:center}
 .k{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}.v{font-size:26px;font-weight:600;font-variant-numeric:tabular-nums}
-.v.sm{font-size:18px}.delta{font-size:13px;margin-left:6px}.pos{color:var(--up)}.neg{color:var(--dn)}
+.delta{font-size:13px;margin-left:6px}.pos{color:var(--up)}.neg{color:var(--dn)}
 .bar{height:6px;background:#1b2230;border-radius:4px;overflow:hidden;margin-top:6px}.bar i{display:block;height:100%;background:var(--acc);transition:width .25s linear}
 .bar i.late{background:var(--warn)}.bar i.end{background:var(--dn)}
 .side{display:flex;flex-direction:column;gap:10px}.side.up .big{background:linear-gradient(180deg,#16a34a,#15803d)}.side.down .big{background:linear-gradient(180deg,#dc2626,#b91c1c)}
 .big{border:0;border-radius:12px;color:#fff;padding:16px;font-size:18px;font-weight:700;cursor:pointer;display:flex;justify-content:space-between;align-items:center;transition:transform .05s}
 .big:active{transform:scale(.98)}.big small{display:block;font-weight:400;font-size:12px;opacity:.85}.big .px{font-size:30px;font-variant-numeric:tabular-nums}
+.be{display:flex;justify-content:space-between;align-items:baseline;background:#0f141d;border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.be .lab{font-size:11px;color:var(--mut)}.be .num{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
 .row{display:flex;gap:8px}.btn{flex:1;border:1px solid var(--line);background:#0f141d;color:var(--txt);border-radius:8px;padding:9px;cursor:pointer;font-size:13px}
-.btn:hover{border-color:var(--acc)}.btn.danger{color:#fca5a5}.btn.active{background:var(--acc);border-color:var(--acc);color:#fff}
+.btn:hover{border-color:var(--acc)}.btn.danger{color:#fca5a5}
 .book{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-variant-numeric:tabular-nums;font-size:12px}
 .lvl{position:relative;display:flex;justify-content:space-between;padding:2px 6px;border-radius:4px;overflow:hidden}
 .lvl b{position:absolute;top:0;bottom:0;right:0;opacity:.14;z-index:0}.lvl span{position:relative;z-index:1}
-.lvl.bid b{background:var(--up)}.lvl.ask b{background:var(--dn)}.lvl.bid{text-align:left}
+.lvl.bid b{background:var(--up)}.lvl.ask b{background:var(--dn)}
 .posbox{display:flex;justify-content:space-between;font-size:13px;color:var(--mut)}.posbox strong{color:var(--txt);font-variant-numeric:tabular-nums}
+.pend{color:var(--warn);font-size:11px;margin-left:4px}
 .chips{display:flex;gap:6px;flex-wrap:wrap}.chip{padding:7px 0;flex:1;text-align:center;border:1px solid var(--line);border-radius:8px;cursor:pointer;font-weight:600;background:#0f141d}
 .chip.active{background:var(--acc);border-color:var(--acc)}.est{font-size:12px;color:var(--mut);margin-top:6px}.est b{color:var(--txt)}
 .log{max-height:360px;overflow:auto;font-size:12px;font-variant-numeric:tabular-nums}.log div{padding:5px 0;border-bottom:1px dashed var(--line);display:flex;gap:8px}
@@ -777,11 +877,12 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="card hero">
   <div><div class="k">BTC 现价 (Chainlink)</div><div class="v" id="btc">—</div></div>
   <div><div class="k">锚定价 <span id="sk_tag"></span></div><div class="v" id="strike">—</div><div class="delta" id="delta"></div></div>
-  <div><div class="k">剩余</div><div class="v" id="left">—</div><div class="bar"><i id="prog" style="width:0"></i></div><div class="est">当前最大滑点 <b id="slip">—</b> · 单笔上限 $<b id="lim">—</b></div></div>
+  <div><div class="k">剩余</div><div class="v" id="left">—</div><div class="bar"><i id="prog" style="width:0"></i></div><div class="est">最大滑点 <b id="slip">—</b> · 单笔上限 $<b id="lim">—</b> · taker 费率 <b id="fr">—</b></div></div>
  </div>
  <div class="card side up">
   <button class="big" onclick="buy('up')"><span>买 UP <small>↑ · FOK · 按盘口模拟</small></span><span class="px" id="up_ask">—</span></button>
-  <div class="posbox"><span>持仓 <strong id="up_pos">0</strong> sh</span><span>市值 <strong id="up_val">$0</strong></span><span>bid <strong id="up_bid">—</strong></span></div>
+  <div class="be"><span class="lab">含费盈亏平衡胜率</span><span class="num" id="up_be">—</span></div>
+  <div class="posbox"><span>持仓 <strong id="up_pos">0</strong> sh<span class="pend" id="up_pend"></span></span><span>市值 <strong id="up_val">$0</strong></span><span>bid <strong id="up_bid">—</strong></span></div>
   <div class="est" id="up_est"></div>
   <div class="row"><button class="btn danger" onclick="act({action:'sell_all',side:'up'})">卖出全部 (Q) FAK</button><button class="btn" onclick="act({action:'sell',side:'up',amount:amt})">卖 $<span class="amtlbl"></span></button></div>
   <div class="book" id="up_book"></div>
@@ -789,7 +890,8 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
  </div>
  <div class="card side down">
   <button class="big" onclick="buy('down')"><span>买 DOWN <small>↓ · FOK · 按盘口模拟</small></span><span class="px" id="down_ask">—</span></button>
-  <div class="posbox"><span>持仓 <strong id="down_pos">0</strong> sh</span><span>市值 <strong id="down_val">$0</strong></span><span>bid <strong id="down_bid">—</strong></span></div>
+  <div class="be"><span class="lab">含费盈亏平衡胜率</span><span class="num" id="down_be">—</span></div>
+  <div class="posbox"><span>持仓 <strong id="down_pos">0</strong> sh<span class="pend" id="down_pend"></span></span><span>市值 <strong id="down_val">$0</strong></span><span>bid <strong id="down_bid">—</strong></span></div>
   <div class="est" id="down_est"></div>
   <div class="row"><button class="btn danger" onclick="act({action:'sell_all',side:'down'})">卖出全部 (W) FAK</button><button class="btn" onclick="act({action:'sell',side:'down',amount:amt})">卖 $<span class="amtlbl"></span></button></div>
   <div class="book" id="down_book"></div>
@@ -808,14 +910,15 @@ HTML = r"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const TOKEN="__TOKEN__",PRESETS=__PRESETS__;let amt=PRESETS[2]||20,S=null,busy=false;
 const $=id=>document.getElementById(id);
+function esc(t){const d=document.createElement('div');d.textContent=t;return d.innerHTML}
 function chips(){$('chips').innerHTML=PRESETS.map((p,i)=>`<div class="chip ${p===amt?'active':''}" onclick="setAmt(${p})">$${p}<br><small style="font-weight:400;color:#9aa4b8">${i+1}</small></div>`).join('');document.querySelectorAll('.amtlbl').forEach(e=>e.textContent=amt)}
 function setAmt(v){amt=v;chips();render()}
-function toast(m,ok){const t=$('toast');t.textContent=m;t.className='toast show '+(ok?'ok':'bad');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',2200)}
+function toast(m,ok){const t=$('toast');t.textContent=m;t.className='toast show '+(ok?'ok':'bad');clearTimeout(t._h);t._h=setTimeout(()=>t.className='toast',2600)}
 async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-Auth-Token':TOKEN},body:JSON.stringify(body)});return r.json()}
 async function act(b){if(busy)return;busy=true;try{const r=await post('/api/trade',b);toast(r.message+(r.elapsed_ms?` (${r.elapsed_ms}ms)`:''),r.success)}catch(e){toast('请求失败 '+e,false)}busy=false}
 function buy(side){act({action:'buy',side,amount:amt})}
 function lim(side,action){const p=parseFloat($(side+'_lp').value);if(!p)return toast('请输入限价',false);act({action,side,price:p,amount:amt})}
-function sim(asks,usd){let left=usd,sh=0,worst=0;for(const l of asks){if(left<=0)break;const t=Math.min(left,l.p*l.s);sh+=t/l.p;left-=t;worst=l.p}return{sh,avg:sh?(usd-left)/sh:0,worst,filled:usd-left}}
+function sim(asks,usd,rate){let left=usd,sh=0,fee=0,worst=0;for(const l of asks){if(left<=1e-9)break;const t=Math.min(left,l.p*l.s);const s=t/l.p;sh+=s;fee+=rate*s*l.p*(1-l.p);left-=t;worst=l.p}const filled=usd-left;return{sh,fee,worst,filled,avg:sh?filled/sh:0,eff:sh?(filled+fee)/sh:0}}
 function book(el,b){const mx=Math.max(1,...b.bids.map(x=>x.s),...b.asks.map(x=>x.s));const row=(l,c)=>`<div class="lvl ${c}"><b style="width:${Math.min(100,l.s/mx*100)}%"></b><span>${l.p.toFixed(2)}</span><span>${Math.round(l.s)}</span></div>`;
  el.innerHTML='<div>'+b.bids.slice(0,6).map(l=>row(l,'bid')).join('')+'</div><div>'+b.asks.slice(0,6).map(l=>row(l,'ask')).join('')+'</div>'}
 function fmt(n,d=2){return n?Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):'—'}
@@ -826,17 +929,20 @@ function render(){if(!S)return;const s=S;
  const left=Math.max(0,s.round_end-s.now),pct=s.round_end?100-left/300*100:0;$('left').textContent=s.round_end?`${Math.floor(left/60)}:${String(Math.floor(left%60)).padStart(2,'0')}`:'—';
  const pr=$('prog');pr.style.width=pct+'%';pr.className=left<15?'end':(left<60?'late':'');
  $('round').textContent=s.round_ts?new Date(s.round_ts*1000).toLocaleTimeString()+' 回合':'等待回合';$('bal').textContent=fmt(s.usdc_balance);
- $('slip').textContent=s.max_slip.toFixed(2);$('lim').textContent=s.limits.order;$('lock').className='lock'+(s.locked?' on':'');$('lock').textContent=s.locked?'🔓 已锁盘 (K)':'🔒 锁盘 (K)';
+ $('slip').textContent=s.max_slip.toFixed(2);$('lim').textContent=s.limits.order;$('fr').textContent=s.fee_rate;
+ $('lock').className='lock'+(s.locked?' on':'');$('lock').textContent=s.locked?'🔓 已锁盘 (K)':'🔒 锁盘 (K)';
  for(const sd of['up','down']){$(sd+'_ask').textContent=s[sd+'_ask']?s[sd+'_ask'].toFixed(2):'—';$(sd+'_bid').textContent=s[sd+'_bid']?s[sd+'_bid'].toFixed(2):'—';
-  $(sd+'_pos').textContent=s[sd+'_position'].toFixed(1);$(sd+'_val').textContent='$'+(s[sd+'_position']*(s[sd+'_bid']||0)).toFixed(2);
-  const r=sim(s[sd+'_book'].asks,amt);const slip=r.avg-s[sd+'_ask'];
-  $(sd+'_est').innerHTML=r.sh?`$${amt} ≈ <b>${r.sh.toFixed(1)} sh</b> 均价 <b>${r.avg.toFixed(3)}</b> 滑点 <b class="${slip>s.max_slip?'neg':''}">${slip.toFixed(3)}</b>${r.filled<amt-0.01?' <span class="neg">深度不足</span>':''}`:'无卖盘';
+  $(sd+'_pos').textContent=s[sd+'_position'].toFixed(1);$(sd+'_pend').textContent=s[sd+'_pending']?'待确认':'';
+  $(sd+'_val').textContent='$'+(s[sd+'_position']*(s[sd+'_bid']||0)).toFixed(2);
+  const r=sim(s[sd+'_book'].asks,amt,s.fee_rate);const slip=r.avg-s[sd+'_ask'];
+  $(sd+'_be').textContent=r.sh?(r.eff*100).toFixed(1)+'%':'—';
+  $(sd+'_est').innerHTML=r.sh?`$${amt} ≈ <b>${r.sh.toFixed(1)} sh</b> 均价 <b>${r.avg.toFixed(3)}</b> · 费 <b>$${r.fee.toFixed(2)}</b> · 含费 <b>${r.eff.toFixed(3)}</b> · 滑点 <b class="${slip>s.max_slip?'neg':''}">${slip.toFixed(3)}</b>${r.filled<amt-0.01?' <span class="neg">深度不足</span>':''}`:'无卖盘';
   book($(sd+'_book'),s[sd+'_book'])}
- const sel=$('acct');if(sel.options.length!==s.accounts.length){sel.innerHTML=s.accounts.map((a,i)=>`<option value="${i}">${a}</option>`).join('')}sel.value=s.account_idx;
- $('log').innerHTML=s.log.map(l=>`<div><span class="t">${l.time}</span><span class="${l.success?'ok':'bad'}">${l.message}</span><span class="ms">${l.elapsed_ms||''}${l.elapsed_ms?'ms':''}</span></div>`).join('')}
+ const sel=$('acct');if(sel.options.length!==s.accounts.length){sel.innerHTML=s.accounts.map((a,i)=>`<option value="${i}">${esc(a)}</option>`).join('')}sel.value=s.account_idx;
+ $('log').innerHTML=s.log.map(l=>`<div><span class="t">${l.time}</span><span class="${l.success?'ok':'bad'}">${esc(l.message)}</span><span class="ms">${l.elapsed_ms?l.elapsed_ms+'ms':''}</span></div>`).join('')}
 function connect(){const es=new EventSource('/api/stream?token='+TOKEN);es.onmessage=e=>{S=JSON.parse(e.data);render()};es.onerror=()=>{es.close();setTimeout(connect,1500)}}
 $('acct').onchange=e=>post('/api/account',{idx:+e.target.value}).then(r=>toast(r.success?'已切换账号':'切换失败',r.success));
-document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'){if(e.key==='Enter'){const id=e.target.id;const sd=id.split('_')[0];lim(sd,'limit_buy')}return}
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'){if(e.key==='Enter'){const sd=e.target.id.split('_')[0];lim(sd,'limit_buy')}return}
  const k=e.key;if(k==='ArrowUp'){e.preventDefault();buy('up')}else if(k==='ArrowDown'){e.preventDefault();buy('down')}
  else if(k==='q'||k==='Q')act({action:'sell_all',side:'up'});else if(k==='w'||k==='W')act({action:'sell_all',side:'down'});
  else if(k==='k'||k==='K')act({action:'toggle_lock'});else if(k==='Escape')act({action:'cancel_all'});
@@ -850,6 +956,7 @@ def start_background():
     threading.Thread(target=ws_worker, daemon=True, name="ws").start()
 
 def main():
+    sync_clock()
     app = web.Application()
     app.router.add_get("/", index)
     app.router.add_get("/api/stream", stream)
@@ -860,7 +967,7 @@ def main():
     print("=" * 64)
     print(f"🚀 BTC 5m Quick Trade  →  {url}")
     print(f"   账号: {', '.join(a['label'] for a in ACCOUNTS) or '未配置'}   builder_code: {'已设置' if BUILDER_CODE else '无'}")
-    print(f"   风控: 单笔≤${MAX_ORDER_USD:.0f}  单边敞口≤${MAX_SIDE_EXPOSURE_USD:.0f}  冷却 {HOTKEY_COOLDOWN_MS}ms")
+    print(f"   风控: 单笔≤${MAX_ORDER_USD:.0f}  单边敞口≤${MAX_SIDE_EXPOSURE_USD:.0f}  冷却 {HOTKEY_COOLDOWN_MS}ms  taker费率 {TAKER_FEE_RATE}")
     print("=" * 64)
     if not _embedded:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
