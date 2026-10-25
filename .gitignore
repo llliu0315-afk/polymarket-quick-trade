@@ -1,5 +1,6 @@
 .env
+.quick_trade_creds_*.json
+.btc5m_creds_*.json
+trades.jsonl
 __pycache__/
 *.pyc
-持仓/
-username_cache.json
