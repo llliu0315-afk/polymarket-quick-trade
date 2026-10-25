@@ -1,36 +1,37 @@
-# BTC 5m Quick Trade (fork of JamesLHW/polymarket-quick-trade)
+# BTC 5m Quick Trade
 
-专注 Polymarket **BTC 5 分钟 Up/Down** 市场的一键交易面板。原版多市场脚本 `quick_trade.py` 与链上大户榜 `onchain_leaderboard.py` 保留未动，新的主程序是 **`btc5m_trade.py`**。
+只做 Polymarket **BTC 5 分钟 Up/Down**（`btc-updown-5m`）的快捷交易面板 + 只读链上持仓研究榜。基于 JamesLHW/polymarket-quick-trade 重写，原多市场面板与终端榜单已移除。
+
+## 文件
+
+| 文件 | 作用 |
+|---|---|
+| `btc5m_trade.py` | 交易面板：CLOB WS 盘口、预拉回合、盘口模拟 + 分段滑点上限、FOK 买 / FAK 卖、风控、SSE 深色 UI、token 鉴权 |
+| `chain_research.py` | 只读链上扫描：增量 `TransferSingle/Batch`、净持仓榜、对冲候选、SQLite 历史与结算、研究提示（不下单） |
+| `run_btc5m.py` | 推荐入口：面板 + 链上榜一起启动，默认锁盘 |
+| `CHAIN_RESEARCH.md` | 链上榜的口径、配置与限制 |
 
 ## 快速开始
 
 ```bash
 pip install -r requirements.txt
-cp .env.template .env   # 填入私钥 / 资金地址
-python btc5m_trade.py   # 终端会打印带 token 的链接, 浏览器自动打开
+cp .env.template .env        # 填私钥 / 资金地址 / ALCHEMY_KEY
+python run_btc5m.py          # 仅交易面板: python btc5m_trade.py
 ```
 
-## 相对原版的改动
-
-| 项目 | 原版 | 本版 |
-|---|---|---|
-| 市场 | BTC/ETH × 5m/15m/1h 切换 | 仅 `btc-updown-5m`，去掉 1h slug 时区换算等逻辑 |
-| 盘口 | 每 0.1s 轮询 REST `/book` | CLOB WebSocket 推送（断线 3s 后自动 REST 兜底） |
-| 换轮 | 新回合开始后再查 token | 结束前 15s 预拉下一轮 token，零等待 |
-| 市价买入 | 固定 +0.10 保护价盲打 | 沿 asks 逐档模拟成交，均价滑点超过阶段上限即拒绝；保护价 = 最差档 +0.01 |
-| 卖出全部 | FOK | 默认 FAK，可部分成交 |
-| 风控 | 无 | 热键冷却、单笔上限、单边敞口上限、最后 N 秒禁买、一键锁盘 (K) |
-| 前端 | 轮询 `/api/state`，内嵌 HTML | SSE 推送，深色重构 UI：现价/锚定价/bp 差值、倒计时进度条、深度柱状盘口、实时成交模拟、连接状态灯 |
-| 安全 | 无鉴权、`verify=False` | 启动随机 token + Origin 校验；TLS 校验保持开启；凭证文件 0600 |
-| builder code | 写死作者的 | 从 `.env` 读取，可留空 |
-| 日志 | 内存 50 条 | 追加写入 `trades.jsonl` |
+终端会打印带 token 的链接，浏览器自动打开。首次运行建议把 `MAX_ORDER_USD` 调到 5。
 
 ## 快捷键
 
 `↑` 买 UP · `↓` 买 DOWN · `Q`/`W` 卖出全部 UP/DOWN · `1-5` 金额 · `Esc` 撤销挂单 · `K` 锁盘/解锁
 
-## 已知事项 / 下一步
+## 风控默认值（.env 可改）
 
-- 依赖的 `py-clob-client-v2` 已被 Polymarket 标记弃用，计划迁移到统一 SDK `polymarket-client`。
-- 尚未接入 CLOB user 频道确认真实成交均价，目前成交价为盘口模拟估算。
-- `onchain_leaderboard.py` 仍为独立运行脚本，尚未与本面板联动。
+单笔 ≤ $200 · 单边敞口 ≤ $500 · 热键冷却 400ms · 最后 5 秒禁止市价买 · 滑点上限 0.03 / 0.05 / 0.08（剩余 >240s / 60–240s / <60s）
+
+## 已知事项
+
+- `py-clob-client-v2` 已被 Polymarket 标记弃用，计划迁移到统一 SDK `polymarket-client`。
+- 成交均价为盘口模拟估算，尚未接入 user 频道确认真实 fill。
+- 链上榜为实验版：初始化余额未逐地址对账、命中率不等于盈利，详见 `CHAIN_RESEARCH.md`。
+- 未做实盘联调；交易前请先以小额验证。

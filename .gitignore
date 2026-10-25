@@ -1,6 +1,6 @@
 .env
-.quick_trade_creds_*.json
 .btc5m_creds_*.json
 trades.jsonl
+data/
 __pycache__/
 *.pyc
